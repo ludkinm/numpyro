@@ -9,7 +9,6 @@ from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 
 from numpyro.distributions.util import cholesky_of_inverse
-from numpyro.infer.hmc_util import euclidean_kinetic_energy
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
 from numpyro.util import cond, identity
@@ -18,17 +17,91 @@ HugState = namedtuple('HugState', ['itr', 'z', 'r', 'potential_energy', 'energy'
                                    'accept_prob', 'mean_accept_prob', 'rng_key'])
 
 
-def hug_integrator(potential_fn, kinetic_fn, step_size, inverse_mass_matrix):
+class preconditioner():
+    """
+    A class for preconditioning
+    param: prototype_var: a prototype for shape and mapping to varaibles
+    param: covar: a covariance matrix
+    """
+
+    def __init__(self, prototype_var, covar=None):
+        flat_var, self.ravel = ravel_pytree(prototype_var)
+        self._covar = covar
+        if self._covar is None:
+            mass_matrix_size = jnp.size(flat_var)
+            assert mass_matrix_size is not None
+            self._covar = jnp.ones(mass_matrix_size)
+            self._covar_sqrt = self._covar
+            self._covar_inv = self._covar
+        elif self._covar.ndim == 1:
+            self._covar_sqrt = jnp.sqrt(self._covar)
+            self._covar_inv = 1.0 / self._covar
+        elif self._covar.ndim == 2:
+            self._covar_sqrt = jnp.linalg.cholesky(self._covar)
+            self._covar_inv = jnp.linalg.inverse(self._covar)
+        else:
+            raise ValueError("covar matrix must be 1 or 2 dimensional.")
+
+    def unravel(self, x):
+        if type(x) is dict:
+            x, _ = ravel_pytree(x)
+        return x
+
+    def sample(self, rng_key):
+        """
+         generate momentum
+         param: prototype_var: A variable with the required shape for a sample
+         param: rng_key: random number key to pass to jax random.
+         """
+        eps = random.normal(rng_key, jnp.shape(self._covar_sqrt)[:1])
+        if self._covar.ndim == 1:
+            r = jnp.multiply(self._covar_sqrt, eps)
+        elif self._covar.ndim == 2:
+            r = jnp.dot(self._covar_sqrt, eps)
+        return self.ravel(r)
+
+    def condition(self, x):
+        """
+        Given a parameter, unravel and muliply by the pre-conditioner matrix
+        """
+        x = self.unravel(x)
+        if self._covar.ndim == 2:
+            v = jnp.matmul(self._covar, x)
+        elif self._covar.ndim == 1:
+            v = jnp.multiply(self._covar, x)
+        return self.ravel(v)
+
+    def inv_condition(self, x):
+        """
+        Given a parameter, unravel and muliply by the inverse pre-conditioner matrix
+        """
+        x = self.unravel(x)
+        if self._covar_inv.ndim == 2:
+            v = jnp.matmul(self._covar_inv, x)
+        elif self._covar_inv.ndim == 1:
+            v = jnp.multiply(self._covar_inv, x)
+        return self.ravel(v)
+
+    def log_prob(self, x):
+        """
+        Get the log_prob supposing this is a normal distribution
+        """
+        x = self.unravel(x)
+        if self._covar_inv.ndim == 2:
+            v = jnp.matmul(self._covar_inv, x)
+        elif self._covar_inv.ndim == 1:
+            v = jnp.multiply(self._covar_inv, x)
+        return 0.5 * jnp.dot(v, x)
+
+
+def hug_integrator(potential_fn, preconditioner, step_size):
     """
     Hug integration helper class, stores all the
     :param potential_fn: Python callable that computes the potential energy
         given input parameters. The input parameters to `potential_fn` can be
         any python collection type.
-    :param kinetic_fn: Python callable that returns the kinetic energy given
-        inverse mass matrix and momentum.
+    :param precondtioner: A precondiitoner
     :param float step_size: Size of a single step.
-    :param inverse_mass_matrix: Inverse of mass matrix, which is used to
-        calculate kinetic energy.
     """
 
     def step(z, r, flip=True):
@@ -40,8 +113,7 @@ def hug_integrator(potential_fn, kinetic_fn, step_size, inverse_mass_matrix):
         z = tree_multimap(lambda z, r: z + step_size * r, z, r)
         if flip:
             g = grad(potential_fn)(z)
-            # this is probably wrong when not using a Gaussian kinetic energy
-            Mg = grad(kinetic_fn, argnums=1)(inverse_mass_matrix, g)
+            Mg = preconditioner.condition(g)
             r = tree_multimap(lambda r, z, g, Mg: r - 2 *
                               jnp.dot(r, g) / jnp.dot(g, Mg) * Mg, r, z, g, Mg)
             return (z, r)
@@ -49,55 +121,6 @@ def hug_integrator(potential_fn, kinetic_fn, step_size, inverse_mass_matrix):
             return (z, r)
 
     return step
-
-
-def momentum_generator(prototype_r, inverse_mass_matrix):
-    """
-    A function factory to make a momentum generation function
-    param: prototype_r: A variable which has the shape of the required momentum -- the position in Hug say.
-    param: inverse_mass_matrix: The mass matrix inverse.
-    """
-    mass_matrix_size = jnp.size(ravel_pytree(prototype_r)[0])
-    if inverse_mass_matrix is None:
-        # Otherwise, there is nothing to do...
-        assert mass_matrix_size is not None
-        inverse_mass_matrix = jnp.ones(mass_matrix_size)
-        mass_matrix_sqrt = inverse_mass_matrix
-
-    if inverse_mass_matrix.ndim == 1:
-        mass_matrix_sqrt = jnp.sqrt(
-            jnp.reciprocal(inverse_mass_matrix))
-
-        def gen(prototype_r, rng_key):
-            """
-            generate momentum
-            param: prototype_r: A variable with the required shape for r (say the position variables for hug)
-            param: rng_key: random number key to pass to jax random.
-            """
-            _, unpack_fn = ravel_pytree(
-                prototype_r)  # get the function that maps variable to flat vector
-            eps = random.normal(rng_key, jnp.shape(
-                mass_matrix_sqrt)[:1])
-            r = jnp.multiply(mass_matrix_sqrt, eps)
-            return unpack_fn(r)
-    elif inverse_mass_matrix.ndim == 2:
-        mass_matrix_sqrt = cholesky_of_inverse(inverse_mass_matrix)
-
-        def gen(prototype_r, rng_key):
-            """
-            generate momentum
-            param: prototype_r: A variable with the required shape for r (the position variable)
-            param: rng_key: random number key to pass to jax random.
-            """
-            _, unpack_fn = ravel_pytree(prototype_r)
-            eps = random.normal(rng_key, jnp.shape(
-                mass_matrix_sqrt)[:1])
-            r = jnp.dot(mass_matrix_sqrt, eps)
-            return unpack_fn(r)
-    else:
-        raise ValueError("Mass matrix has incorrect number of dims.")
-
-    return inverse_mass_matrix, gen
 
 
 class Hug(MCMCKernel):
@@ -111,38 +134,32 @@ class Hug(MCMCKernel):
         given input parameters. The input parameters to `potential_fn` can be
         any python collection type, provided that `init_params` argument to
         `init_kernel` has the same type.
-    :param kinetic_fn: Python callable that returns the kinetic energy given
-        inverse mass matrix and momentum. If not provided, the default is
-        euclidean kinetic energy.
     :param float step_size: Determines the size of a single step taken by the
         hug integrator while computing the trajectory using Hug
         dynamics. If not specified, it will be set to 1.0.
     :param float trajectory_length: Length of a single Hug trajectory. Default
         value is 1.0.
-    :param inverse_mass_matrix: Inverse of mass matrix, which is used to
-        calculate/simulte kinetic energy.
+    :param covar_matrix: The covariance matrix of a preconditioner,
+        used when bouncing and to sample momenta.
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
     """
 
-    def __init__(self, model=None, potential_fn=None, kinetic_fn=None,
-                 step_size=1.0, trajectory_length=1, inverse_mass_matrix=None,
+    def __init__(self, model=None, potential_fn=None,
+                 step_size=1.0, trajectory_length=1, covar_matrix=None,
                  init_strategy=init_to_uniform):
         if not (model is None) ^ (potential_fn is None):
             raise ValueError(
                 'Only one of `model` or `potential_fn` must be specified.')
         self._model = model
         self._potential_fn = potential_fn
-        self._kinetic_fn = kinetic_fn if kinetic_fn is not None else euclidean_kinetic_energy
-        self._step_size = step_size
+        self._step_size = min(step_size, trajectory_length)
         self._trajectory_length = trajectory_length
-        self._num_bounces = max(2, 2*math.floor(trajectory_length/step_size))
-        self._inverse_mass_matrix = inverse_mass_matrix
+        self._num_bounces = max(1, math.ceil(trajectory_length/step_size))
+        self._covar_matrix = covar_matrix
         self._init_strategy = init_strategy
         # Set on first call to init
         self._postprocess_fn = None
-        self._stepper = None
-        self._momentum_generator = None
 
     def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
         # non-vectorized
@@ -178,20 +195,20 @@ class Hug(MCMCKernel):
         else:
             z = init_params
 
-        # init momentum generator
-        self._inverse_mass_matrix, self._momentum_generator = momentum_generator(
-            z, self._inverse_mass_matrix)
+        # init preconditioner
+        self._preconditioner = preconditioner(z, self._covar_matrix)
 
         # init stepper
         self._stepper = hug_integrator(
-            self._potential_fn, self._kinetic_fn, self._step_size, self._inverse_mass_matrix)
+            self._potential_fn, self._preconditioner, self._step_size)
 
+        # init state function
         def init_fn(init_params, rng_key):
             # split rng
             pe = self._potential_fn(z)
             rng_key_hug, rng_key_momentum = random.split(rng_key, 2)
-            r = self._momentum_generator(z, rng_key_momentum)
-            energy = pe + self._kinetic_fn(self._inverse_mass_matrix, r)
+            r = self._preconditioner.sample(rng_key_momentum)
+            energy = pe + self._preconditioner.log_prob(r)
             # init state
             init_state = HugState(0, z, r, pe, energy, 0,
                                   0.0, 0.0, rng_key_hug)
@@ -222,16 +239,17 @@ class Hug(MCMCKernel):
         # random state splitting
         rng_key, rng_key_mom, rng_key_tran = random.split(rng_key, 3)
         # resample momneta
-        r = self._momentum_generator(z, rng_key_mom)
+        r = self._preconditioner.sample(rng_key_mom)
         # store current energy
-        curr_energy = curr_pe + self._kinetic_fn(self._inverse_mass_matrix, r)
+        curr_energy = curr_pe + self._preconditioner.log_prob(r)
 
         # do bounces
         for i in range(0, self._num_bounces):
             z, r = self._stepper(z, r)
+            z, r = self._stepper(z, r, i == self._num_bounces)
 
         prop_pe = self._potential_fn(z)
-        prop_energy = prop_pe + self._kinetic_fn(self._inverse_mass_matrix, r)
+        prop_energy = prop_pe + + self._preconditioner.log_prob(r)
 
         delta_energy = prop_energy - curr_energy
         delta_energy = jnp.where(
