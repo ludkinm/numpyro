@@ -51,46 +51,53 @@ def hug_integrator(potential_fn, kinetic_fn, step_size, inverse_mass_matrix):
     return step
 
 
-class momentum_generator():
-    def __init__(self, z, inverse_mass_matrix):
-        mass_matrix_size = jnp.size(ravel_pytree(z)[0])
-        if inverse_mass_matrix is None:
-            assert mass_matrix_size is not None
-            inverse_mass_matrix = jnp.ones(mass_matrix_size)
-            self._mass_matrix_sqrt = inverse_mass_matrix
-        elif inverse_mass_matrix.ndim == 1:
-            self._mass_matrix_sqrt = jnp.sqrt(
-                jnp.reciprocal(inverse_mass_matrix))
-        elif inverse_mass_matrix.ndim == 2:
-            self._mass_matrix_sqrt = cholesky_of_inverse(inverse_mass_matrix)
-        else:
-            raise ValueError("Mass matrix has incorrect number of dims.")
+def momentum_generator(prototype_r, inverse_mass_matrix):
+    """
+    A function factory to make a momentum generation function
+    param: prototype_r: A variable which has the shape of the required momentum -- the position in Hug say.
+    param: inverse_mass_matrix: The mass matrix inverse.
+    """
+    mass_matrix_size = jnp.size(ravel_pytree(prototype_r)[0])
+    if inverse_mass_matrix is None:
+        # Otherwise, there is nothing to do...
+        assert mass_matrix_size is not None
+        inverse_mass_matrix = jnp.ones(mass_matrix_size)
+        mass_matrix_sqrt = inverse_mass_matrix
 
-        if inverse_mass_matrix.ndim == 1:
-            def gen(prototype_r, rng_key):
-                """
-                generate momentum
-                param: prototype_r: A variable with the required shape for r (the position variable)
-                param: rng_key: random number key to pass to jax random.
-                """
-                _, unpack_fn = ravel_pytree(prototype_r)
-                eps = random.normal(rng_key, jnp.shape(
-                    self._mass_matrix_sqrt)[:1])
-                r = jnp.multiply(self._mass_matrix_sqrt, eps)
-                return unpack_fn(r)
-        elif inverse_mass_matrix.ndim == 2:
-            def gen(prototype_r, rng_key):
-                """
-                generate momentum
-                param: prototype_r: A variable with the required shape for r (the position variable)
-                param: rng_key: random number key to pass to jax random.
-                """
-                _, unpack_fn = ravel_pytree(prototype_r)
-                eps = random.normal(rng_key, jnp.shape(
-                    self._mass_matrix_sqrt)[:1])
-                r = jnp.dot(self._mass_matrix_sqrt, eps)
-                return unpack_fn(r)
-        self.gen = gen
+    if inverse_mass_matrix.ndim == 1:
+        mass_matrix_sqrt = jnp.sqrt(
+            jnp.reciprocal(inverse_mass_matrix))
+
+        def gen(prototype_r, rng_key):
+            """
+            generate momentum
+            param: prototype_r: A variable with the required shape for r (say the position variables for hug)
+            param: rng_key: random number key to pass to jax random.
+            """
+            _, unpack_fn = ravel_pytree(
+                prototype_r)  # get the function that maps variable to flat vector
+            eps = random.normal(rng_key, jnp.shape(
+                mass_matrix_sqrt)[:1])
+            r = jnp.multiply(mass_matrix_sqrt, eps)
+            return unpack_fn(r)
+    elif inverse_mass_matrix.ndim == 2:
+        mass_matrix_sqrt = cholesky_of_inverse(inverse_mass_matrix)
+
+        def gen(prototype_r, rng_key):
+            """
+            generate momentum
+            param: prototype_r: A variable with the required shape for r (the position variable)
+            param: rng_key: random number key to pass to jax random.
+            """
+            _, unpack_fn = ravel_pytree(prototype_r)
+            eps = random.normal(rng_key, jnp.shape(
+                mass_matrix_sqrt)[:1])
+            r = jnp.dot(mass_matrix_sqrt, eps)
+            return unpack_fn(r)
+    else:
+        raise ValueError("Mass matrix has incorrect number of dims.")
+
+    return inverse_mass_matrix, gen
 
 
 class Hug(MCMCKernel):
@@ -171,25 +178,19 @@ class Hug(MCMCKernel):
         else:
             z = init_params
 
-        # default mass matrix if None
-        if self._inverse_mass_matrix is None:
-            mass_matrix_size = jnp.size(ravel_pytree(z)[0])
-            assert mass_matrix_size is not None
-            self._inverse_mass_matrix = jnp.ones(mass_matrix_size)
+        # init momentum generator
+        self._inverse_mass_matrix, self._momentum_generator = momentum_generator(
+            z, self._inverse_mass_matrix)
 
         # init stepper
         self._stepper = hug_integrator(
             self._potential_fn, self._kinetic_fn, self._step_size, self._inverse_mass_matrix)
 
-        # init momentum generator
-        self._momentum_generator = momentum_generator(
-            z, self._inverse_mass_matrix)
-
         def init_fn(init_params, rng_key):
             # split rng
             pe = self._potential_fn(z)
             rng_key_hug, rng_key_momentum = random.split(rng_key, 2)
-            r = self._momentum_generator.gen(z, rng_key_momentum)
+            r = self._momentum_generator(z, rng_key_momentum)
             energy = pe + self._kinetic_fn(self._inverse_mass_matrix, r)
             # init state
             init_state = HugState(0, z, r, pe, energy, 0,
@@ -221,7 +222,7 @@ class Hug(MCMCKernel):
         # random state splitting
         rng_key, rng_key_mom, rng_key_tran = random.split(rng_key, 3)
         # resample momneta
-        r = self._momentum_generator.gen(z, rng_key_mom)
+        r = self._momentum_generator(z, rng_key_mom)
         # store current energy
         curr_energy = curr_pe + self._kinetic_fn(self._inverse_mass_matrix, r)
 

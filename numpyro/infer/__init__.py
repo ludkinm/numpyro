@@ -3,6 +3,7 @@
 
 from numpyro.infer.elbo import ELBO, RenyiELBO
 from numpyro.infer.hmc import HMC, NUTS
+from numpyro.infer.hug import Hug
 from numpyro.infer.initialization import (
     init_to_feasible,
     init_to_median,
@@ -27,6 +28,7 @@ __all__ = [
     'HMC',
     'MCMC',
     'NUTS',
+    'Hug',
     'Predictive',
     'SA',
     'SVI',
