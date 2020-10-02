@@ -4,6 +4,8 @@
 from numpyro.infer.elbo import ELBO, RenyiELBO
 from numpyro.infer.hmc import HMC, NUTS
 from numpyro.infer.hug import Hug
+from numpyro.infer.alternator import Alternator
+from numpyro.infer.hop import Hop
 from numpyro.infer.initialization import (
     init_to_feasible,
     init_to_median,
@@ -29,6 +31,8 @@ __all__ = [
     'MCMC',
     'NUTS',
     'Hug',
+    'Hop',
+    'Alternator',
     'Predictive',
     'SA',
     'SVI',

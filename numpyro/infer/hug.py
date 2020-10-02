@@ -2,19 +2,16 @@ from collections import namedtuple
 import warnings
 import math
 
-from jax import grad, random, vmap, device_put
-from jax.tree_util import tree_multimap
-
+from jax import grad, random, vmap, device_put, value_and_grad
 from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 
-from numpyro.distributions.util import cholesky_of_inverse
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
 from numpyro.util import cond, identity
 
-HugState = namedtuple('HugState', ['itr', 'z', 'r', 'potential_energy', 'energy', 'num_steps',
-                                   'accept_prob', 'mean_accept_prob', 'rng_key'])
+HState = namedtuple('HState', ['itr', 'z', 'potential_energy', 'grad', 'num_steps',
+                               'accept_prob', 'rng_key'])
 
 
 class preconditioner():
@@ -26,11 +23,11 @@ class preconditioner():
 
     def __init__(self, prototype_var, covar=None):
         flat_var, self.ravel = ravel_pytree(prototype_var)
+        self._dimension = jnp.size(flat_var)
         self._covar = covar
         if self._covar is None:
-            mass_matrix_size = jnp.size(flat_var)
-            assert mass_matrix_size is not None
-            self._covar = jnp.ones(mass_matrix_size)
+            assert self._dimension is not None
+            self._covar = jnp.ones(self._dimension)
             self._covar_sqrt = self._covar
             self._covar_inv = self._covar
         elif self._covar.ndim == 1:
@@ -58,18 +55,18 @@ class preconditioner():
             r = jnp.multiply(self._covar_sqrt, eps)
         elif self._covar.ndim == 2:
             r = jnp.dot(self._covar_sqrt, eps)
-        return self.ravel(r)
+        return r
 
     def condition(self, x):
         """
-        Given a parameter, unravel and muliply by the pre-conditioner matrix
+        Given a parameter, unravel, muliply by the pre-conditioner matrix, re-ravel
         """
         x = self.unravel(x)
         if self._covar.ndim == 2:
             v = jnp.matmul(self._covar, x)
         elif self._covar.ndim == 1:
             v = jnp.multiply(self._covar, x)
-        return self.ravel(v)
+        return v
 
     def inv_condition(self, x):
         """
@@ -80,7 +77,7 @@ class preconditioner():
             v = jnp.matmul(self._covar_inv, x)
         elif self._covar_inv.ndim == 1:
             v = jnp.multiply(self._covar_inv, x)
-        return self.ravel(v)
+        return v
 
     def log_prob(self, x):
         """
@@ -91,36 +88,60 @@ class preconditioner():
             v = jnp.matmul(self._covar_inv, x)
         elif self._covar_inv.ndim == 1:
             v = jnp.multiply(self._covar_inv, x)
-        return 0.5 * jnp.dot(v, x)
+        return -0.5 * jnp.dot(v, x)
 
-
-def hug_integrator(potential_fn, preconditioner, step_size):
-    """
-    Hug integration helper class, stores all the
-    :param potential_fn: Python callable that computes the potential energy
-        given input parameters. The input parameters to `potential_fn` can be
-        any python collection type.
-    :param precondtioner: A precondiitoner
-    :param float step_size: Size of a single step.
-    """
-
-    def step(z, r, flip=True):
+    def dot(self, x, y):
         """
-        :param: z, r: position, momenta pair
-        :param: flip: should the velocity be flipped? No if the last step to save a grad
-        :return: new state for the integrator.
+        Compute x^\top \Sigma y where \Sigma is the preconditioner denoted by self.
         """
-        z = tree_multimap(lambda z, r: z + step_size * r, z, r)
-        if flip:
-            g = grad(potential_fn)(z)
-            Mg = preconditioner.condition(g)
-            r = tree_multimap(lambda r, z, g, Mg: r - 2 *
-                              jnp.dot(r, g) / jnp.dot(g, Mg) * Mg, r, z, g, Mg)
-            return (z, r)
-        else:
-            return (z, r)
+        x = self.unravel(x)
+        y = self.unravel(y)
+        if self._covar_inv.ndim == 2:
+            v = jnp.matmul(self._covar, x)
+        elif self._covar_inv.ndim == 1:
+            v = jnp.multiply(self._covar, x)
+        return jnp.dot(v, y)
 
-    return step
+    def inv_dot(self, x, y):
+        """
+        Compute x^\top \Sigma^{-1} y where \Sigma is the preconditioner denoted by self.
+        """
+        x = self.unravel(x)
+        y = self.unravel(y)
+        if self._covar_inv.ndim == 2:
+            v = jnp.matmul(self._covar_inv, x)
+        elif self._covar_inv.ndim == 1:
+            v = jnp.multiply(self._covar_inv, x)
+        return jnp.dot(v, y)
+
+
+def huggy(nbounce, step_size, z, z_pe, preconditioner, potential_fn, rng_key):
+    # Sample momenta from the preconditioner
+    r = preconditioner.sample(rng_key)
+
+    # unravel z and g w from tree to vector
+    z = preconditioner.unravel(z)
+
+    # store log accept ratio
+    logar = z_pe - preconditioner.log_prob(r)
+
+    # do bounces
+    for i in range(0, nbounce):
+        z = z + step_size * r
+        g = grad(potential_fn)(preconditioner.ravel(z))
+        Sg = preconditioner.condition(g)
+        g = preconditioner.unravel(g)
+        r = r - 2 * jnp.dot(r, g) / jnp.dot(g, Sg) * Sg
+        z = z + step_size * r
+
+    # update log accept ratio
+    logar = logar - z_pe + preconditioner.log_prob(r)
+    logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
+    accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
+
+    z = preconditioner.ravel(z)
+    g = grad(potential_fn)(z)
+    return accept_prob, z, z_pe, g
 
 
 class Hug(MCMCKernel):
@@ -191,27 +212,18 @@ class Hug(MCMCKernel):
 
         # init state
         if isinstance(init_params, ParamInfo):
-            z, _, _ = init_params
+            z, pe, z_grad = init_params
         else:
-            z = init_params
+            z, pe, z_grad = init_params, None, None
+            pe, z_grad = value_and_grad(self._potential_fn)(z)
 
         # init preconditioner
         self._preconditioner = preconditioner(z, self._covar_matrix)
 
-        # init stepper
-        self._stepper = hug_integrator(
-            self._potential_fn, self._preconditioner, self._step_size)
-
         # init state function
         def init_fn(init_params, rng_key):
-            # split rng
-            pe = self._potential_fn(z)
-            rng_key_hug, rng_key_momentum = random.split(rng_key, 2)
-            r = self._preconditioner.sample(rng_key_momentum)
-            energy = pe + self._preconditioner.log_prob(r)
             # init state
-            init_state = HugState(0, z, r, pe, energy, 0,
-                                  0.0, 0.0, rng_key_hug)
+            init_state = HState(0, z, pe, z_grad, 0, 0.0, rng_key)
             return device_put(init_state)
 
         if rng_key.ndim == 1:
@@ -227,7 +239,7 @@ class Hug(MCMCKernel):
         Run Hug from the given :data:`~numpyro.infer.hug.HugState` and return
         the resulting :data:`~numpyro.infer.hug.HugState`.
 
-        :param HugState hug_state: Represents the current state.
+        :param HugState curr_state: Represents the current state.
         :param model_args: Arguments provided to the model.
         :param model_kwargs: Keyword arguments provided to the model.
         :return: Next `hug_state` after running Hug.
@@ -235,39 +247,24 @@ class Hug(MCMCKernel):
         # process input
         model_kwargs = {} if model_kwargs is None else model_kwargs
         # unpack current state
-        itr, z, _, curr_pe, _, num_steps, _, mean_accept_prob, rng_key = curr_state
+        itr, curr_z, curr_pe, _, num_steps, _, rng_key = curr_state
         # random state splitting
-        rng_key, rng_key_mom, rng_key_tran = random.split(rng_key, 3)
-        # resample momneta
-        r = self._preconditioner.sample(rng_key_mom)
-        # store current energy
-        curr_energy = curr_pe + self._preconditioner.log_prob(r)
+        rng_key, rng_key_hug, rng_key_tran = random.split(rng_key, 3)
 
-        # do bounces
-        for i in range(0, self._num_bounces):
-            z, r = self._stepper(z, r)
-            z, r = self._stepper(z, r, i == self._num_bounces)
+        # do hug
+        accept_prob, prop_z, prop_pe, prop_grad = huggy(self._num_bounces, self._step_size, curr_z, curr_pe,
+                                                        self._preconditioner, self._potential_fn, rng_key_hug)
 
-        prop_pe = self._potential_fn(z)
-        prop_energy = prop_pe + + self._preconditioner.log_prob(r)
-
-        delta_energy = prop_energy - curr_energy
-        delta_energy = jnp.where(
-            jnp.isnan(delta_energy), jnp.inf, delta_energy)
-        accept_prob = jnp.clip(jnp.exp(-delta_energy), a_max=1.0)
         transition = random.bernoulli(rng_key_tran, accept_prob)
 
-        prop_state = HugState(itr+1, z, r, prop_pe, prop_energy,
-                              num_steps, accept_prob, 0.0, rng_key)
+        prop_state = HState(itr+1, prop_z, prop_pe, prop_grad,
+                            num_steps, accept_prob, rng_key)
         next_state = cond(transition, (prop_state),
                           identity, (curr_state), identity)
-
         itr = itr + 1
-        mean_accept_prob = mean_accept_prob + \
-            (accept_prob - mean_accept_prob) / itr
 
-        return HugState(itr, next_state.z, next_state.r, next_state.potential_energy,
-                        next_state.energy, num_steps, accept_prob, mean_accept_prob, rng_key)
+        return HState(itr, next_state.z, next_state.potential_energy, next_state.grad,
+                      num_steps, accept_prob, rng_key)
 
     def postprocess_fn(self, args, kwargs):
         if self._postprocess_fn is None:
