@@ -135,12 +135,13 @@ def huggy(nbounce, step_size, z, z_pe, preconditioner, potential_fn, rng_key):
         z = z + step_size * r
 
     # update log accept ratio
+    z = preconditioner.ravel(z)
+    z_pe, g = value_and_grad(potential_fn)(z)
+
     logar = logar - z_pe + preconditioner.log_prob(r)
     logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
     accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
 
-    z = preconditioner.ravel(z)
-    g = grad(potential_fn)(z)
     return accept_prob, z, z_pe, g
 
 
@@ -211,6 +212,7 @@ class Hug(MCMCKernel):
                              ' `potential_fn`.')
 
         # init state
+        print("initializing init_params for hug")
         if isinstance(init_params, ParamInfo):
             z, pe, z_grad = init_params
         else:
@@ -218,6 +220,7 @@ class Hug(MCMCKernel):
             pe, z_grad = value_and_grad(self._potential_fn)(z)
 
         # init preconditioner
+        print("initializing preconditioner for hug")
         self._preconditioner = preconditioner(z, self._covar_matrix)
 
         # init state function
@@ -232,6 +235,8 @@ class Hug(MCMCKernel):
             init_state = vmap(init_fn)(init_params, rng_key)
             sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
             self._sample_fn = sample_fn
+
+        print("finished init for hug")
         return init_state
 
     def sample(self, curr_state, model_args, model_kwargs):

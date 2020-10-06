@@ -37,7 +37,6 @@ def hoppy(mu, lam, z, z_grad, z_pe, preconditioner, potential_fn, rng_key):
 
     # proposed values
     z_pe, z_grad = value_and_grad(potential_fn)(z)
-    z = preconditioner.unravel(z)
     g = preconditioner.unravel(z_grad)
     Sg = preconditioner.condition(z_grad)
     gSg = jnp.dot(g, Sg)
@@ -52,7 +51,6 @@ def hoppy(mu, lam, z, z_grad, z_pe, preconditioner, potential_fn, rng_key):
     logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
     accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
 
-    z = preconditioner.ravel(z)
     return accept_prob, z, z_grad, z_pe
 
 
@@ -129,7 +127,7 @@ class Hop(MCMCKernel):
         self._dimension = self._preconditioner._dimension
 
         init_state = HState(0, z, pe, z_grad, 0, 0.0, rng_key)
-
+        print("finished init for hug")
         return device_put(init_state)
 
     def sample(self, curr_state, model_args, model_kwargs):
