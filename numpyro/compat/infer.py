@@ -132,7 +132,7 @@ class SVI(svi.SVI):
         except TypeError as e:
             if 'not a valid JAX type' in str(e):
                 raise TypeError('NumPyro backend requires args, kwargs to be arrays or tuples, '
-                                'dicts of arrays.')
+                                'dicts of arrays.') from e
             else:
                 raise e
         params = jit(super(SVI, self).get_params)(self.svi_state)
@@ -143,7 +143,7 @@ class SVI(svi.SVI):
         return super(SVI, self).get_params(self.svi_state)
 
 
-class Trace_ELBO(elbo.ELBO):
+class Trace_ELBO(elbo.Trace_ELBO):
     def __init__(self,
                  num_particles=1,
                  max_plate_nesting=float('inf'),

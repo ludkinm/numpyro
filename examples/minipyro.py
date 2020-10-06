@@ -10,7 +10,7 @@ from jax.random import PRNGKey
 import numpyro
 from numpyro import optim
 import numpyro.distributions as dist
-from numpyro.infer import ELBO, SVI
+from numpyro.infer import SVI, Trace_ELBO
 from numpyro.util import fori_loop
 
 
@@ -35,7 +35,7 @@ def main(args):
     # model/guide pair.
     adam = optim.Adam(args.learning_rate)
 
-    svi = SVI(model, guide, adam, ELBO(num_particles=100))
+    svi = SVI(model, guide, adam, Trace_ELBO(num_particles=100))
     svi_state = svi.init(PRNGKey(0), data)
 
     # Training loop
@@ -58,7 +58,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    assert numpyro.__version__.startswith('0.3.0')
+    assert numpyro.__version__.startswith('0.4.0')
     parser = argparse.ArgumentParser(description="Mini Pyro demo")
     parser.add_argument("-f", "--full-pyro", action="store_true", default=False)
     parser.add_argument("-n", "--num-steps", default=1001, type=int)

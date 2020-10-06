@@ -18,11 +18,12 @@ import jax.random as random
 from jax.scipy.special import logsumexp
 
 import numpyro.distributions as dist
-from numpyro.distributions import constraints, transforms
+from numpyro.distributions import constraints, kl_divergence, transforms
 from numpyro.distributions.discrete import _to_probs_bernoulli, _to_probs_multinom
 from numpyro.distributions.flows import InverseAutoregressiveTransform
 from numpyro.distributions.transforms import LowerCholeskyAffine, PermuteTransform, PowerTransform, biject_to
-from numpyro.distributions.util import matrix_to_tril_vec, multinomial, signed_stick_breaking_tril, vec_to_tril_matrix
+from numpyro.distributions.util import (matrix_to_tril_vec, multinomial, signed_stick_breaking_tril,
+                                        sum_rightmost, vec_to_tril_matrix)
 from numpyro.nn import AutoregressiveNN
 
 
@@ -192,10 +193,12 @@ DISCRETE = [
     T(dist.CategoricalProbs, jnp.array([[0.1, 0.5, 0.4], [0.4, 0.4, 0.2]])),
     T(dist.CategoricalLogits, jnp.array([-5.])),
     T(dist.CategoricalLogits, jnp.array([1., 2., -2.])),
+    T(dist.CategoricalLogits, jnp.array([[-1, 2., 3.], [3., -4., -2.]])),
     T(dist.Delta, 1),
     T(dist.Delta, jnp.array([0., 2.])),
     T(dist.Delta, jnp.array([0., 2.]), jnp.array([-2., -4.])),
-    T(dist.CategoricalLogits, jnp.array([[-1, 2., 3.], [3., -4., -2.]])),
+    T(dist.DirichletMultinomial, jnp.array([1.0, 2.0, 3.9]), 10),
+    T(dist.DirichletMultinomial, jnp.array([0.2, 0.7, 1.1]), jnp.array([5, 5])),
     T(dist.GammaPoisson, 2., 2.),
     T(dist.GammaPoisson, jnp.array([6., 2]), jnp.array([2., 8.])),
     T(dist.GeometricProbs, 0.2),
@@ -520,7 +523,7 @@ def test_log_prob_LKJCholesky(dimension, concentration):
     expected_log_prob = beta_log_prob - affine_logdet - signed_stick_breaking_logdet
     assert_allclose(actual_log_prob, expected_log_prob, rtol=2e-5)
 
-    assert_allclose(jax.jit(d.log_prob)(sample), d.log_prob(sample), atol=1e-7)
+    assert_allclose(jax.jit(d.log_prob)(sample), d.log_prob(sample), atol=2e-6)
 
 
 @pytest.mark.parametrize('rate', [0.1, 0.5, 0.9, 1.0, 1.1, 2.0, 10.0])
@@ -556,6 +559,23 @@ def test_beta_binomial_log_prob(total_count, shape):
 
     actual = dist.BetaBinomial(concentration1, concentration0, total_count).log_prob(value)
     assert_allclose(actual, expected, rtol=0.02)
+
+
+@pytest.mark.parametrize("total_count", [1, 2, 3, 10])
+@pytest.mark.parametrize("batch_shape", [(1,), (3, 1), (2, 3, 1)])
+def test_dirichlet_multinomial_log_prob(total_count, batch_shape):
+    event_shape = (3,)
+    concentration = np.exp(np.random.normal(size=batch_shape + event_shape))
+    # test on one-hots
+    value = total_count * jnp.eye(event_shape[-1]).reshape(event_shape + (1,) * len(batch_shape) + event_shape)
+
+    num_samples = 100000
+    probs = dist.Dirichlet(concentration).sample(random.PRNGKey(0), (num_samples, 1))
+    log_probs = dist.Multinomial(total_count, probs).log_prob(value)
+    expected = logsumexp(log_probs, 0) - jnp.log(num_samples)
+
+    actual = dist.DirichletMultinomial(concentration, total_count).log_prob(value)
+    assert_allclose(actual, expected, rtol=0.05)
 
 
 @pytest.mark.parametrize("shape", [(1,), (3, 1), (2, 3, 1)])
@@ -768,7 +788,7 @@ def test_categorical_log_prob_grad():
      jnp.array([False, True, True, False, True, False])),
     (constraints.interval(-3, 5), 0, True),
     (constraints.interval(-3, 5), jnp.array([-5, -3, 0, 5, 7]),
-     jnp.array([False, False, True, False, False])),
+     jnp.array([False, True, True, True, False])),
     (constraints.less_than(1), -2, True),
     (constraints.less_than(1), jnp.array([-1, 1, 5]), jnp.array([True, False, False])),
     (constraints.lower_cholesky, jnp.array([[1., 0.], [-2., 0.1]]), True),
@@ -791,7 +811,7 @@ def test_categorical_log_prob_grad():
      jnp.array([True, False, False])),
     (constraints.unit_interval, 0.1, True),
     (constraints.unit_interval, jnp.array([-5, 0, 0.5, 1, 7]),
-     jnp.array([False, False, True, False, False])),
+     jnp.array([False, True, True, True, False])),
 ])
 def test_constraints(constraint, x, expected):
     assert_array_equal(constraint(x), expected)
@@ -1163,3 +1183,47 @@ def test_expand_pytree():
 
     assert lax.map(g, jnp.ones((5, 3))).batch_shape == (5, 10, 3)
     assert jax.tree_map(lambda x: x[None], g(0)).batch_shape == (1, 10, 3)
+
+
+@pytest.mark.parametrize('batch_shape', [(), (4,), (2, 3)], ids=str)
+def test_kl_delta_normal_shape(batch_shape):
+    v = np.random.normal(size=batch_shape)
+    loc = np.random.normal(size=batch_shape)
+    scale = np.exp(np.random.normal(size=batch_shape))
+    p = dist.Delta(v)
+    q = dist.Normal(loc, scale)
+    assert kl_divergence(p, q).shape == batch_shape
+
+
+@pytest.mark.parametrize('batch_shape', [(), (4,), (2, 3)], ids=str)
+@pytest.mark.parametrize('event_shape', [(), (4,), (2, 3)], ids=str)
+def test_kl_independent_normal(batch_shape, event_shape):
+    shape = batch_shape + event_shape
+    p = dist.Normal(np.random.normal(size=shape), np.exp(np.random.normal(size=shape)))
+    q = dist.Normal(np.random.normal(size=shape), np.exp(np.random.normal(size=shape)))
+    actual = kl_divergence(dist.Independent(p, len(event_shape)),
+                           dist.Independent(q, len(event_shape)))
+    expected = sum_rightmost(kl_divergence(p, q), len(event_shape))
+    assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize('batch_shape', [(), (4,), (2, 3)], ids=str)
+@pytest.mark.parametrize('event_shape', [(), (4,), (2, 3)], ids=str)
+def test_kl_expanded_normal(batch_shape, event_shape):
+    shape = batch_shape + event_shape
+    p = dist.Normal(np.random.normal(), np.exp(np.random.normal())).expand(shape)
+    q = dist.Normal(np.random.normal(), np.exp(np.random.normal())).expand(shape)
+    actual = kl_divergence(dist.Independent(p, len(event_shape)),
+                           dist.Independent(q, len(event_shape)))
+    expected = sum_rightmost(kl_divergence(p, q), len(event_shape))
+    assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize('shape', [(), (4,), (2, 3)], ids=str)
+def test_kl_normal_normal(shape):
+    p = dist.Normal(np.random.normal(size=shape), np.exp(np.random.normal(size=shape)))
+    q = dist.Normal(np.random.normal(size=shape), np.exp(np.random.normal(size=shape)))
+    actual = kl_divergence(p, q)
+    x = p.sample(random.PRNGKey(0), (10000,)).copy()
+    expected = jnp.mean((p.log_prob(x) - q.log_prob(x)), 0)
+    assert_allclose(actual, expected, rtol=0.05)

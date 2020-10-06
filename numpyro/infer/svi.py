@@ -3,7 +3,7 @@
 
 from functools import namedtuple, partial
 
-from jax import random, value_and_grad
+from jax import random
 
 from numpyro.distributions import constraints
 from numpyro.distributions.transforms import biject_to
@@ -16,6 +16,11 @@ A :func:`~collections.namedtuple` consisting of the following fields:
  - **optim_state** - current optimizer's state.
  - **rng_key** - random number generator seed used for the iteration.
 """
+
+
+def _apply_loss_fn(loss_fn, rng_key, constrain_fn, model, guide,
+                   args, kwargs, static_kwargs, params):
+    return loss_fn(rng_key, constrain_fn(params), model, guide, *args, **kwargs, **static_kwargs)
 
 
 class SVI(object):
@@ -36,7 +41,7 @@ class SVI(object):
         >>> import numpyro
         >>> import numpyro.distributions as dist
         >>> from numpyro.distributions import constraints
-        >>> from numpyro.infer import SVI, ELBO
+        >>> from numpyro.infer import SVI, Trace_ELBO
 
         >>> def model(data):
         ...     f = numpyro.sample("latent_fairness", dist.Beta(10, 10))
@@ -50,7 +55,7 @@ class SVI(object):
 
         >>> data = jnp.concatenate([jnp.ones(6), jnp.zeros(4)])
         >>> optimizer = numpyro.optim.Adam(step_size=0.0005)
-        >>> svi = SVI(model, guide, optimizer, loss=ELBO())
+        >>> svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
         >>> init_state = svi.init(random.PRNGKey(0), data)
         >>> state = lax.fori_loop(0, 2000, lambda i, state: svi.update(state, data)[0], init_state)
         >>> # or to collect losses during the loop
@@ -127,11 +132,9 @@ class SVI(object):
         :return: tuple of `(svi_state, loss)`.
         """
         rng_key, rng_key_step = random.split(svi_state.rng_key)
-        params = self.optim.get_params(svi_state.optim_state)
-        loss_val, grads = value_and_grad(
-            lambda x: self.loss.loss(rng_key_step, self.constrain_fn(x), self.model, self.guide,
-                                     *args, **kwargs, **self.static_kwargs))(params)
-        optim_state = self.optim.update(grads, svi_state.optim_state)
+        loss_fn = partial(_apply_loss_fn, self.loss.loss, rng_key_step, self.constrain_fn, self.model,
+                          self.guide, args, kwargs, self.static_kwargs)
+        loss_val, optim_state = self.optim.eval_and_update(loss_fn, svi_state.optim_state)
         return SVIState(optim_state, rng_key), loss_val
 
     def evaluate(self, svi_state, *args, **kwargs):

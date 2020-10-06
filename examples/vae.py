@@ -22,7 +22,7 @@ import numpyro
 from numpyro import optim
 import numpyro.distributions as dist
 from numpyro.examples.datasets import MNIST, load_dataset
-from numpyro.infer import ELBO, SVI
+from numpyro.infer import SVI, Trace_ELBO
 
 RESULTS_DIR = os.path.abspath(os.path.join(os.path.dirname(inspect.getfile(lambda: None)),
                               '.results'))
@@ -72,7 +72,7 @@ def main(args):
     encoder_nn = encoder(args.hidden_dim, args.z_dim)
     decoder_nn = decoder(args.hidden_dim, 28 * 28)
     adam = optim.Adam(args.learning_rate)
-    svi = SVI(model, guide, adam, ELBO(), hidden_dim=args.hidden_dim, z_dim=args.z_dim)
+    svi = SVI(model, guide, adam, Trace_ELBO(), hidden_dim=args.hidden_dim, z_dim=args.z_dim)
     rng_key = PRNGKey(0)
     train_init, train_fetch = load_dataset(MNIST, batch_size=args.batch_size, split='train')
     test_init, test_fetch = load_dataset(MNIST, batch_size=args.batch_size, split='test')
@@ -131,7 +131,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    assert numpyro.__version__.startswith('0.3.0')
+    assert numpyro.__version__.startswith('0.4.0')
     parser = argparse.ArgumentParser(description="parse args")
     parser.add_argument('-n', '--num-epochs', default=15, type=int, help='number of training epochs')
     parser.add_argument('-lr', '--learning-rate', default=1.0e-3, type=float, help='learning rate')

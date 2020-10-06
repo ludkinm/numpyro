@@ -1,7 +1,7 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from numpyro.infer.elbo import ELBO, RenyiELBO
+from numpyro.infer.elbo import ELBO, RenyiELBO, Trace_ELBO, TraceMeanField_ELBO
 from numpyro.infer.hmc import HMC, NUTS
 from numpyro.infer.hug import Hug
 from numpyro.infer.alternator import Alternator
@@ -27,6 +27,8 @@ __all__ = [
     'log_likelihood',
     'ELBO',
     'RenyiELBO',
+    'Trace_ELBO',
+    'TraceMeanField_ELBO',
     'HMC',
     'MCMC',
     'NUTS',

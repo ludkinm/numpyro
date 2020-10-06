@@ -30,7 +30,7 @@ from numpyro import optim
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
-from numpyro.infer import ELBO, MCMC, NUTS, SVI
+from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoBNAFNormal
 from numpyro.infer.reparam import NeuTraReparam
 
@@ -66,7 +66,7 @@ def main(args):
     vanilla_samples = mcmc.get_samples()['x'].copy()
 
     guide = AutoBNAFNormal(dual_moon_model, hidden_factors=[args.hidden_factor, args.hidden_factor])
-    svi = SVI(dual_moon_model, guide, optim.Adam(0.003), ELBO())
+    svi = SVI(dual_moon_model, guide, optim.Adam(0.003), Trace_ELBO())
     svi_state = svi.init(random.PRNGKey(1))
 
     print("Start training guide...")
@@ -145,7 +145,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    assert numpyro.__version__.startswith('0.3.0')
+    assert numpyro.__version__.startswith('0.4.0')
     parser = argparse.ArgumentParser(description="NeuTra HMC")
     parser.add_argument('-n', '--num-samples', nargs='?', default=4000, type=int)
     parser.add_argument('--num-warmup', nargs='?', default=1000, type=int)
