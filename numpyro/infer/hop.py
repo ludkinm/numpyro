@@ -1,5 +1,3 @@
-import warnings
-
 from jax import random, grad, value_and_grad, vmap, device_put
 
 import jax.numpy as jnp
@@ -15,11 +13,11 @@ def hoppy(mu, lam, z, z_grad, z_pe, preconditioner, potential_fn, rng_key):
     w = preconditioner.sample(rng_key)
 
     # unravel z, g and w from tree to vector
-    z = preconditioner.unravel(z)
-    g = preconditioner.unravel(z_grad)
+    z = preconditioner.flatten(z)
+    g = preconditioner.flatten(z_grad)
 
     # propose new z value using hop
-    Sg = preconditioner.condition(z_grad)
+    Sg = preconditioner.condition(g)
     gSg = jnp.dot(g, Sg)
     rho2 = jnp.clip(gSg, a_min=1.0)
 
@@ -33,12 +31,12 @@ def hoppy(mu, lam, z, z_grad, z_pe, preconditioner, potential_fn, rng_key):
         * jnp.dot(g, r)**2
 
     # proposal
-    z = preconditioner.ravel(z + r)
+    z = preconditioner.unflatten(z + r)
 
     # proposed values
     z_pe, z_grad = value_and_grad(potential_fn)(z)
-    g = preconditioner.unravel(z_grad)
-    Sg = preconditioner.condition(z_grad)
+    g = preconditioner.flatten(z_grad)
+    Sg = preconditioner.condition(g)
     gSg = jnp.dot(g, Sg)
     rho2 = jnp.clip(gSg, a_min=1.0)
 
@@ -101,11 +99,6 @@ class Hop(MCMCKernel):
             init_params, model_potential_fn, postprocess_fn, model_trace = initialize_model(
                 rng_key, self._model, dynamic_args=True, init_strategy=self._init_strategy,
                 model_args=model_args, model_kwargs=model_kwargs)
-            if any(v['type'] == 'param' for v in model_trace.values()):
-                warnings.warn("'param' sites will be treated as constants during inference. To define "
-                              "an improper variable, please use a 'sample' site with log probability "
-                              "masked out. For example, `sample('x', dist.LogNormal(0, 1).mask(False)` "
-                              "means that `x` has improper distribution over the positive domain.")
             # use the keyword arguments for the model to build the potential function
             kwargs = {} if model_kwargs is None else model_kwargs
             self._potential_fn = model_potential_fn(*model_args, **kwargs)
@@ -123,7 +116,7 @@ class Hop(MCMCKernel):
             pe, z_grad = value_and_grad(self._potential_fn)(z)
 
         # init preconditioner
-        self._preconditioner = preconditioner(z, self._covar_matrix)
+        self._preconditioner = preconditioner(z, covar=self._covar_matrix)
         self._dimension = self._preconditioner._dimension
 
         init_state = HState(0, z, pe, z_grad, 0, 0.0, rng_key)
