@@ -4,7 +4,7 @@ from jax import random, grad, value_and_grad, vmap, device_put
 
 import jax.numpy as jnp
 
-from numpyro.infer.hug import preconditioner, HState
+from numpyro.infer.hug_util import preconditioner, HState
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
 from numpyro.util import cond, identity
