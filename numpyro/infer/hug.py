@@ -1,77 +1,43 @@
 import math
 
-from jax import random, vmap, device_put, value_and_grad
+from jax import random, vmap, device_put, grad, value_and_grad
 import jax.numpy as jnp
+from jax.tree_util import tree_multimap
 
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
 from numpyro.util import cond, identity
-from numpyro.infer.hug_util import flat_grad, preconditioner, HState, flat_hessian
+from numpyro.infer.hug_util import Preconditioner, HState, to_accept_prob
 
 
-def huggy(nbounce, step_size, z, z_pe, preconditioner, potential_fn, rng_key):
-    # Sample momenta from the preconditioner
-    r = preconditioner.sample(rng_key)
+# def huggy_hess(nbounce, step_size, z, z_pe, potential_fn, rng_key):
+#     conditioner = preconditioner(z, covar_inv=flat_hessian(potential_fn, z))
+#     # Sample momenta from the preconditioner
+#     r = conditioner.sample(rng_key)
+#     # unravel z and g w from tree to vector
+#     z = conditioner.flatten(z)
+#     # store log accept ratio
+#     logar = z_pe - conditioner.log_prob(r)
+#     # do bounces
+#     for i in range(0, nbounce):
+#         z = z + step_size * r
+#         conditioner = preconditioner(
+#             z, covar_inv=flat_hessian(potential_fn, conditioner.unflatten(z)))
+#         g = flat_grad(potential_fn, z, conditioner)
+#         Sg = conditioner.condition(g)
+#         r = r - 2 * jnp.dot(r, g) / jnp.dot(g, Sg) * Sg
+#         z = z + step_size * r
 
-    # unravel z and g w from tree to vector
-    z = preconditioner.flatten(z)
+#     # update log accept ratio
+#     z = conditioner.unflatten(z)
+#     conditioner = preconditioner(z, covar_inv=flat_hessian(potential_fn, z))
+#     z_pe, g = value_and_grad(potential_fn)(z)
 
-    # store log accept ratio
-    logar = z_pe - preconditioner.log_prob(r)
+#     logar = logar - z_pe + conditioner.log_prob(r)
+#     logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
+#     accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
 
-    # do bounces
-    for i in range(0, nbounce):
-        z = z + step_size * r
-        g = flat_grad(potential_fn, z, preconditioner)
-        Sg = preconditioner.condition(g)
-        r = r - 2 * jnp.dot(r, g) / jnp.dot(g, Sg) * Sg
-        z = z + step_size * r
-
-    # update log accept ratio
-    z = preconditioner.unflatten(z)
-    z_pe, g = value_and_grad(potential_fn)(z)
-
-    logar = logar - z_pe + preconditioner.log_prob(r)
-    logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
-    accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
-
-    return accept_prob, z, z_pe, g
-
-
-def huggy_hess(nbounce, step_size, z, z_pe, potential_fn, rng_key):
-    conditioner = preconditioner(z, covar_inv=-flat_hessian(potential_fn, z))
-    # Sample momenta from the preconditioner
-    r = conditioner.sample(rng_key)
-    print(f"{r=}")
-    # unravel z and g w from tree to vector
-    z = conditioner.flatten(z)
-    print(f"{z=}")
-    # store log accept ratio
-    logar = z_pe - conditioner.log_prob(r)
-    print(f"{logar=}")
-    # do bounces
-    for i in range(0, nbounce):
-        print(f"{i=}")
-        z = z + step_size * r
-        print(f"{z=}")
-        conditioner = preconditioner(
-            z, covar_inv=-flat_hessian(potential_fn, conditioner.unflatten(z)))
-        g = flat_grad(potential_fn, z, conditioner)
-        print(f"{g=}")
-        Sg = conditioner.condition(g)
-        r = r - 2 * jnp.dot(r, g) / jnp.dot(g, Sg) * Sg
-        z = z + step_size * r
-
-    # update log accept ratio
-    z = conditioner.unflatten(z)
-    conditioner = preconditioner(z, covar_inv=-flat_hessian(potential_fn, z))
-    z_pe, g = value_and_grad(potential_fn)(z)
-
-    logar = logar - z_pe + conditioner.log_prob(r)
-    logar = jnp.where(jnp.isnan(logar), jnp.inf, logar)
-    accept_prob = jnp.clip(jnp.exp(logar), a_max=1.0)
-
-    return accept_prob, z, z_pe, g
+#     return accept_prob, z, z_pe, g
 
 
 class Hug(MCMCKernel):
@@ -90,14 +56,15 @@ class Hug(MCMCKernel):
         dynamics. If not specified, it will be set to 1.0.
     :param float trajectory_length: Length of a single Hug trajectory. Default
         value is 1.0.
-    :param covar_matrix: The covariance matrix of a preconditioner,
-        used when bouncing and to sample momenta.
+    :param preconditioner: A multivariate to sample momenta, the covariance is
+        used when bouncing.
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
     """
 
     def __init__(self, model=None, potential_fn=None,
-                 step_size=1.0, trajectory_length=1, covar_matrix=None,
+                 step_size=1.0, trajectory_length=1,
+                 covar=None, covar_inv=None,
                  init_strategy=init_to_uniform):
         if not (model is None) ^ (potential_fn is None):
             raise ValueError(
@@ -107,7 +74,8 @@ class Hug(MCMCKernel):
         self._step_size = min(step_size, trajectory_length)
         self._trajectory_length = trajectory_length
         self._num_bounces = max(1, math.ceil(trajectory_length/step_size))
-        self._covar_matrix = covar_matrix
+        self._covar = covar
+        self._covar_inv = covar_inv
         self._init_strategy = init_strategy
         # Set on first call to init
         self._postprocess_fn = None
@@ -136,7 +104,6 @@ class Hug(MCMCKernel):
                              ' `potential_fn`.')
 
         # init state
-        print("initializing init_params for hug")
         if isinstance(init_params, ParamInfo):
             z, pe, z_grad = init_params
         else:
@@ -144,8 +111,7 @@ class Hug(MCMCKernel):
             pe, z_grad = value_and_grad(self._potential_fn)(z)
 
         # init preconditioner
-        print("initializing preconditioner for hug")
-        self._preconditioner = preconditioner(z, covar=self._covar_matrix)
+        self._preconditioner = Preconditioner(z, self._covar, self._covar_inv)
 
         # init state function
         def init_fn(init_params, rng_key):
@@ -160,7 +126,6 @@ class Hug(MCMCKernel):
             sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
             self._sample_fn = sample_fn
 
-        print("finished init for hug")
         return init_state
 
     def sample(self, curr_state, model_args, model_kwargs):
@@ -173,27 +138,41 @@ class Hug(MCMCKernel):
         :param model_kwargs: Keyword arguments provided to the model.
         :return: Next `hug_state` after running Hug.
         """
-        # process input
-        model_kwargs = {} if model_kwargs is None else model_kwargs
         # unpack current state
-        itr, curr_z, curr_pe, _, num_steps, _, rng_key = curr_state
+        itr, curr_z, curr_pe, curr_grad, num_steps, _, rng_key = curr_state
         # random state splitting
-        rng_key, rng_key_hug, rng_key_tran = random.split(rng_key, 3)
+        rng_key_hug, rng_key_tran, rng_key = random.split(rng_key, 3)
 
-        # do hug
-        accept_prob, prop_z, prop_pe, prop_grad = huggy(self._num_bounces, self._step_size, curr_z, curr_pe,
-                                                        self._preconditioner, self._potential_fn, rng_key_hug)
+        def dot(x, y):
+            return jnp.dot(self._preconditioner.flatten(x), self._preconditioner.flatten(y))
 
+        # Sample momenta from the preconditioner and get the log_probability of it
+        r, lpr = self._preconditioner.sample(rng_key)
+
+        # store log accept ratio
+        logar = curr_pe - lpr
+
+        # proposal
+        prop_z = curr_z
+        for _ in range(0, self._num_bounces):
+            prop_z = tree_multimap(
+                lambda z, r: z + self._step_size * r, prop_z, r)  # z(n+1)
+            g = grad(self._potential_fn)(prop_z)
+            Sg = self._preconditioner.condition(g)
+            A = 2.0 * dot(r, g) / dot(g, Sg)
+            r = tree_multimap(lambda r, Sg: r - A * Sg, r, Sg)  # z(n+1)
+            prop_z = tree_multimap(
+                lambda z, r: z + self._step_size * r, prop_z, r)  # z(n+1)
+
+        # update log accept ratio
+        prop_pe, prop_grad = value_and_grad(self._potential_fn)(prop_z)
+        logar = logar - prop_pe + self._preconditioner.log_prob(r)
+        accept_prob = to_accept_prob(logar)
         transition = random.bernoulli(rng_key_tran, accept_prob)
+        next_z, next_pe, next_grad = cond(transition, (prop_z, prop_pe, prop_grad),
+                                          identity, (curr_z, curr_pe, curr_grad), identity)
 
-        prop_state = HState(itr+1, prop_z, prop_pe, prop_grad,
-                            num_steps, accept_prob, rng_key)
-        next_state = cond(transition, (prop_state),
-                          identity, (curr_state), identity)
-        itr = itr + 1
-
-        return HState(itr, next_state.z, next_state.potential_energy, next_state.grad,
-                      num_steps, accept_prob, rng_key)
+        return HState(itr+1, next_z, next_pe, next_grad, num_steps, accept_prob, rng_key)
 
     def postprocess_fn(self, args, kwargs):
         if self._postprocess_fn is None:
